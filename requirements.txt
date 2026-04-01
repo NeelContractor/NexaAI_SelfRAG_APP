@@ -1,0 +1,10 @@
+pydantic
+langchain_community
+langchain_ollama
+langchain_text_splitters
+langchain_core
+langgraph
+dotenv
+pypdf
+faiss-cpu
+streamlit
