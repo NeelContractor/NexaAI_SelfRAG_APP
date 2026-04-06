@@ -1,10 +1,12 @@
 pydantic
-langchain_community
-langchain_ollama
-langchain_text_splitters
-langchain_core
+langchain-community
+langchain-groq
+langchain-huggingface
+langchain-text-splitters
+langchain-core
 langgraph
-dotenv
+python-dotenv
 pypdf
 faiss-cpu
+sentence-transformers
 streamlit

@@ -1,18 +1,7 @@
-"""
-backend.py
-Self-RAG pipeline using LangGraph + Ollama.
-Import and call `run_rag(question)` from Streamlit.
-
-Bugs fixed vs original:
-  - `serach_kwargs` typo → `search_kwargs`
-  - `isuse` field added to State TypedDict
-  - Initial state built cleanly inside `run_rag()` so each call is independent
-  - MAX_RETRIES / MAX_REWRITE_TRIES exposed as module-level constants
-"""
-
 from __future__ import annotations
 
 import os
+import streamlit as st
 from typing import List, Literal, TypedDict
 
 from dotenv import load_dotenv
@@ -20,26 +9,45 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
+try:
+    for key, value in st.secrets.items():
+        if isinstance(value, str):
+            os.environ.setdefault(key, value)
+except Exception:
+    pass
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-DOCUMENTS_DIR   = "./documents"
-EMBED_MODEL     = "nomic-embed-text"
-CHAT_MODEL      = "qwen3:0.6b"
-CHUNK_SIZE      = 600
-CHUNK_OVERLAP   = 150
-RETRIEVER_K     = 4
-MAX_RETRIES     = 10   # IsSUP revise loop
-MAX_REWRITE_TRIES = 3  # IsUSE → rewrite loop
+DOCUMENTS_DIR     = "./documents"
+CHUNK_SIZE        = 600
+CHUNK_OVERLAP     = 150
+RETRIEVER_K       = 4
+MAX_RETRIES       = 10
+MAX_REWRITE_TRIES = 3
 
+# ---------------------------------------------------------------------------
+# LLM + Embeddings
+# ---------------------------------------------------------------------------
+
+_llm = ChatGroq(
+    model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+    api_key=os.getenv("GROQ_API_KEY"),
+    temperature=0,
+)
+
+_embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
 # ---------------------------------------------------------------------------
 # Build vector store (done once at import time)
@@ -68,14 +76,11 @@ def _load_vector_store() -> FAISS:
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
     ).split_documents(docs)
 
-    embeddings = OllamaEmbeddings(model=EMBED_MODEL)
-    return FAISS.from_documents(chunks, embeddings)
+    return FAISS.from_documents(chunks, _embeddings)
 
 
 _vector_store = _load_vector_store()
-# BUG FIX: was `serach_kwargs` (typo) → `search_kwargs`
 _retriever = _vector_store.as_retriever(search_kwargs={"k": RETRIEVER_K})
-_llm = ChatOllama(model=CHAT_MODEL, temperature=0)
 
 
 # ---------------------------------------------------------------------------
@@ -83,35 +88,26 @@ _llm = ChatOllama(model=CHAT_MODEL, temperature=0)
 # ---------------------------------------------------------------------------
 
 class State(TypedDict):
-    question:       str
+    question:        str
     retrieval_query: str
-    rewrite_tries:  int
-
-    need_retrieval: bool
-    docs:           List[Document]
-    relevant_docs:  List[Document]
-    context:        str
-    answer:         str
-
-    issup:    Literal["fully_supported", "partially_supported", "no_support", ""]
-    evidence: List[str]
-    retries:  int
-
-    # BUG FIX: `isuse` was missing from State TypedDict in the original code
-    isuse:    Literal["useful", "not_useful", ""]
-    use_reason: str
-
-    # Extra field for Streamlit trace panel
-    trace:    List[str]
+    rewrite_tries:   int
+    need_retrieval:  bool
+    docs:            List[Document]
+    relevant_docs:   List[Document]
+    context:         str
+    answer:          str
+    issup:           Literal["fully_supported", "partially_supported", "no_support", ""]
+    evidence:        List[str]
+    retries:         int
+    isuse:           Literal["useful", "not_useful", ""]
+    use_reason:      str
+    trace:           List[str]
 
 
 # ---------------------------------------------------------------------------
 # 1. Decide retrieval
 # ---------------------------------------------------------------------------
 
-# Keywords that ALWAYS force retrieval regardless of LLM decision.
-# Small models like qwen3:0.6b are unreliable at structured-output routing,
-# so a deterministic keyword guard runs first.
 _ALWAYS_RETRIEVE_KEYWORDS = [
     "nexaai", "nexa ai", "nexa-ai",
     "company", "culture", "ceo", "founder", "team", "employee",
@@ -122,38 +118,18 @@ _ALWAYS_RETRIEVE_KEYWORDS = [
     "document", "documents",
 ]
 
-# Questions that are clearly meta / conversational — never need retrieval.
 _META_KEYWORDS = [
     "hello", "hi ", "hey", "what can you do", "how are you",
     "who are you", "what are you",
 ]
 
-# Short factual questions that are purely general-knowledge (math, science, grammar…)
-_GENERAL_KNOWLEDGE_PATTERNS = [
-    "what is the capital",
-    "how do i",
-    "define ",
-    "what does",        # only if NOT about NexaAI
-]
-
 
 def _force_retrieve(question: str) -> bool | None:
-    """
-    Returns True  → always retrieve
-            False → never retrieve (direct answer)
-            None  → let the LLM decide
-    """
     q = question.lower()
-
-    # Meta / greeting → direct
     if any(kw in q for kw in _META_KEYWORDS):
         return False
-
-    # Any NexaAI / company / policy / product keyword → retrieve
     if any(kw in q for kw in _ALWAYS_RETRIEVE_KEYWORDS):
         return True
-
-    # Otherwise let the LLM decide
     return None
 
 
@@ -191,7 +167,6 @@ def decide_retrieval(state: State) -> dict:
     trace = state.get("trace", [])
     question = state["question"]
 
-    # Fast-path: keyword override (avoids unreliable LLM structured output)
     forced = _force_retrieve(question)
     if forced is True:
         trace.append("🔍 Decide retrieval → **retrieve** _(keyword match)_")
@@ -200,14 +175,12 @@ def decide_retrieval(state: State) -> dict:
         trace.append("🔍 Decide retrieval → **direct answer** _(keyword match)_")
         return {"need_retrieval": False, "trace": trace}
 
-    # Slow-path: ask the LLM
     try:
         decision: RetrieveDecision = _should_retrieve_llm.invoke(
             _decide_retrieval_prompt.format_messages(question=question)
         )
         should = decision.should_retrieve
     except Exception:
-        # If structured output fails, default to retrieve (safer)
         should = True
 
     trace.append(f"🔍 Decide retrieval → **{'retrieve' if should else 'direct answer'}** _(LLM decision)_")
@@ -219,7 +192,7 @@ def _route_after_decide(state: State) -> Literal["generate_direct", "retrieve"]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Direct answer (no retrieval)
+# 2. Direct answer
 # ---------------------------------------------------------------------------
 
 _direct_generation_prompt = ChatPromptTemplate.from_messages([
@@ -230,9 +203,8 @@ _direct_generation_prompt = ChatPromptTemplate.from_messages([
         "- For greetings or small talk, respond naturally and warmly.\n"
         "- For general knowledge questions (math, science, definitions), answer directly.\n"
         "- If the question is about a specific company, person, product, or policy "
-        "that you don\'t have reliable information about, say: "
-        "\'I don\'t have specific information about that. "
-        "Try asking something else!\'\n"
+        "that you don't have reliable information about, say: "
+        "'I don't have specific information about that. Try asking something else!'\n"
         "- Keep answers concise.",
     ),
     ("human", "{question}"),
@@ -305,12 +277,9 @@ def is_relevant(state: State) -> dict:
             if decision.is_relevant:
                 relevant_docs.append(doc)
         except Exception:
-            # Structured output parse failure — accept the doc (safe default)
             relevant_docs.append(doc)
             failed += 1
 
-    # Safety net: if the model filtered everything out, fall back to all retrieved docs.
-    # This prevents the small model's conservative bias from silently killing answers.
     if not relevant_docs and all_docs:
         relevant_docs = all_docs
         trace = state.get("trace", [])
@@ -369,7 +338,11 @@ def generate_from_context(state: State) -> dict:
 def no_answer_found(state: State) -> dict:
     trace = state.get("trace", [])
     trace.append("❌ No relevant documents found — returning fallback")
-    return {"answer": "I couldn't find a specific answer in the company documents for that question. Try rephrasing or ask something else!", "context": "", "trace": trace}
+    return {
+        "answer": "I couldn't find a specific answer in the company documents for that question. Try rephrasing or ask something else!",
+        "context": "",
+        "trace": trace,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -387,16 +360,12 @@ _issup_prompt = ChatPromptTemplate.from_messages([
         "You are verifying whether the ANSWER is supported by the CONTEXT.\n"
         "Return JSON with keys: issup, evidence.\n"
         "issup must be one of: fully_supported, partially_supported, no_support.\n\n"
-        "- fully_supported: every meaningful claim is explicitly supported; no unsupported qualitative phrasing.\n"
-        "- partially_supported: core facts are supported BUT answer includes any abstraction/interpretation "
-        "not in CONTEXT (e.g. 'generous', 'robust', 'employee-first').\n"
+        "- fully_supported: every meaningful claim is explicitly supported.\n"
+        "- partially_supported: core facts are supported BUT answer includes abstraction/interpretation not in CONTEXT.\n"
         "- no_support: key claims are not supported by CONTEXT.\n\n"
         "evidence: up to 3 short direct quotes from CONTEXT supporting the supported parts.",
     ),
-    (
-        "human",
-        "Question:\n{question}\n\nAnswer:\n{answer}\n\nContext:\n{context}\n",
-    ),
+    ("human", "Question:\n{question}\n\nAnswer:\n{answer}\n\nContext:\n{context}\n"),
 ])
 
 _issup_llm = _llm.with_structured_output(IsSUPDecision)
@@ -441,10 +410,7 @@ _revise_prompt = ChatPromptTemplate.from_messages([
         "- Do NOT add any words besides bullet dashes and the quotes.\n"
         "- Do NOT explain or say 'context', 'not mentioned', etc.",
     ),
-    (
-        "human",
-        "Question:\n{question}\n\nCurrent Answer:\n{answer}\n\nCONTEXT:\n{context}",
-    ),
+    ("human", "Question:\n{question}\n\nCurrent Answer:\n{answer}\n\nCONTEXT:\n{context}"),
 ])
 
 
@@ -524,8 +490,8 @@ _rewrite_prompt = ChatPromptTemplate.from_messages([
         "system",
         "Rewrite the user's QUESTION into a query optimised for vector retrieval over INTERNAL company PDFs.\n\n"
         "Rules:\n"
-        "- Keep it short (6–16 words).\n"
-        "- Add 2–5 high-signal keywords that likely appear in policy/pricing docs.\n"
+        "- Keep it short (6-16 words).\n"
+        "- Add 2-5 high-signal keywords that likely appear in policy/pricing docs.\n"
         "- Remove filler words.\n"
         "- Do NOT answer the question.\n"
         "- Output JSON with key: retrieval_query",
@@ -556,11 +522,11 @@ def rewrite_question(state: State) -> dict:
     )
     return {
         "retrieval_query": decision.retrieval_query,
-        "rewrite_tries": rewrite_tries,
-        "docs": [],
-        "relevant_docs": [],
-        "context": "",
-        "trace": trace,
+        "rewrite_tries":   rewrite_tries,
+        "docs":            [],
+        "relevant_docs":   [],
+        "context":         "",
+        "trace":           trace,
     }
 
 
@@ -568,7 +534,7 @@ def rewrite_question(state: State) -> dict:
 # Build graph
 # ---------------------------------------------------------------------------
 
-def _build_graph() -> object:
+def _build_graph():
     g = StateGraph(State)
 
     g.add_node("decide_retrieval",      decide_retrieval)
@@ -584,20 +550,17 @@ def _build_graph() -> object:
     g.add_node("rewrite_question",      rewrite_question)
 
     g.add_edge(START, "decide_retrieval")
-
     g.add_conditional_edges(
         "decide_retrieval", _route_after_decide,
         {"generate_direct": "generate_direct", "retrieve": "retrieve"},
     )
     g.add_edge("generate_direct", END)
-
     g.add_edge("retrieve", "is_relevant")
     g.add_conditional_edges(
         "is_relevant", _route_after_relevance,
         {"generate_from_context": "generate_from_context", "no_answer_found": "no_answer_found"},
     )
     g.add_edge("no_answer_found", END)
-
     g.add_edge("generate_from_context", "is_sup")
     g.add_conditional_edges(
         "is_sup", _route_after_issup,
@@ -605,7 +568,6 @@ def _build_graph() -> object:
     )
     g.add_edge("revise_answer", "is_sup")
     g.add_edge("accept_answer", "is_use")
-
     g.add_conditional_edges(
         "is_use", _route_after_isuse,
         {"END": END, "rewrite_question": "rewrite_question", "no_answer_found": "no_answer_found"},
@@ -623,36 +585,21 @@ _app = _build_graph()
 # ---------------------------------------------------------------------------
 
 def run_rag(question: str) -> dict:
-    """
-    Run the Self-RAG pipeline for a given question.
-
-    Returns a dict with:
-        answer      str   – final answer
-        issup       str   – grounding verdict
-        isuse       str   – usefulness verdict
-        use_reason  str   – reason for isuse verdict
-        evidence    list  – supporting quotes from context
-        retries     int   – IsSUP revise iterations
-        rewrite_tries int – query rewrite iterations
-        need_retrieval bool
-        relevant_docs list[Document]
-        trace       list[str]  – human-readable step log
-    """
     initial_state: State = {
-        "question":       question,
+        "question":        question,
         "retrieval_query": "",
-        "rewrite_tries":  0,
-        "need_retrieval": False,
-        "docs":           [],
-        "relevant_docs":  [],
-        "context":        "",
-        "answer":         "",
-        "issup":          "",
-        "evidence":       [],
-        "retries":        0,
-        "isuse":          "",
-        "use_reason":     "",
-        "trace":          [],
+        "rewrite_tries":   0,
+        "need_retrieval":  False,
+        "docs":            [],
+        "relevant_docs":   [],
+        "context":         "",
+        "answer":          "",
+        "issup":           "",
+        "evidence":        [],
+        "retries":         0,
+        "isuse":           "",
+        "use_reason":      "",
+        "trace":           [],
     }
     result = _app.invoke(initial_state, config={"recursion_limit": 80})
     return result
