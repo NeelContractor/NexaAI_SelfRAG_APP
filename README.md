@@ -3,7 +3,7 @@
 A Self-RAG (Retrieval-Augmented Generation) chatbot built using LangGraph + Ollama + Streamlit.
 It intelligently decides when to retrieve company documents and ensures answers are grounded, useful, and verifiable.
 
-<img src="https://github.com/NeelContractor/NexaAI_SelfRAG_APP/blob/main/demo.png" width="70%" height="70%">
+<img src="https://github.com/NeelContractor/NexaAI_SelfRAG_APP/blob/main/public/demo.png" width="70%" height="70%">
 
 ## Features
 - Smart Retrieval Decision
